@@ -2,12 +2,15 @@ package com.mapbox.navigation.examples.core
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
 import android.os.Bundle
 import android.widget.SeekBar
 import androidx.appcompat.app.AppCompatActivity
 import com.google.gson.Gson
 import com.google.gson.internal.LinkedTreeMap
 import com.mapbox.android.core.location.LocationEngine
+import com.mapbox.android.core.location.LocationEngineCallback
+import com.mapbox.android.core.location.LocationEngineResult
 import com.mapbox.api.directions.v5.DirectionsCriteria
 import com.mapbox.api.directions.v5.models.DirectionsRoute
 import com.mapbox.api.directions.v5.models.RouteOptions
@@ -15,13 +18,12 @@ import com.mapbox.base.common.logger.model.Message
 import com.mapbox.common.logger.MapboxLogger
 import com.mapbox.mapboxsdk.camera.CameraUpdateFactory
 import com.mapbox.mapboxsdk.geometry.LatLng
-import com.mapbox.mapboxsdk.location.LocationComponentActivationOptions
-import com.mapbox.mapboxsdk.location.modes.CameraMode
 import com.mapbox.mapboxsdk.location.modes.RenderMode
 import com.mapbox.mapboxsdk.maps.MapboxMap
 import com.mapbox.mapboxsdk.maps.Style
 import com.mapbox.navigation.base.internal.extensions.applyDefaultParams
 import com.mapbox.navigation.base.internal.extensions.coordinates
+import com.mapbox.navigation.base.options.HandheldProfile
 import com.mapbox.navigation.core.MapboxNavigation
 import com.mapbox.navigation.core.directions.session.RoutesRequestCallback
 import com.mapbox.navigation.core.replay.MapboxReplayer
@@ -31,12 +33,15 @@ import com.mapbox.navigation.core.replay.history.ReplayEventBase
 import com.mapbox.navigation.core.replay.history.ReplayEventsObserver
 import com.mapbox.navigation.core.replay.history.ReplayHistoryMapper
 import com.mapbox.navigation.examples.R
+import com.mapbox.navigation.examples.history.HistoryFilesActivity
 import com.mapbox.navigation.examples.utils.Utils
 import com.mapbox.navigation.examples.utils.extensions.toPoint
+import com.mapbox.navigation.navigator.internal.MapboxNativeNavigatorImpl
 import com.mapbox.navigation.ui.camera.NavigationCamera
 import com.mapbox.navigation.ui.map.NavigationMapboxMap
 import java.io.IOException
 import java.io.InputStream
+import java.lang.ref.WeakReference
 import java.nio.charset.Charset.forName
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
@@ -66,9 +71,19 @@ class ReplayHistoryActivity : AppCompatActivity() {
         setContentView(R.layout.activity_replay_history_layout)
         mapView.onCreate(savedInstanceState)
 
+        selectHistoryButton.setOnClickListener {
+            val activityIntent = Intent(this, HistoryFilesActivity::class.java)
+            startActivityForResult(activityIntent, 1)
+        }
+
         getNavigationAsync {
             navigationContext = it
             it.onNavigationReady()
+
+            it.mapboxMap.moveCamera(CameraUpdateFactory.zoomTo(15.0))
+            it.navigationMapboxMap.updateCameraTrackingMode(NavigationCamera.NAVIGATION_TRACKING_MODE_GPS)
+            it.locationEngine.getLastLocation(FirstLocationCallback(it))
+            it.mapboxNavigation.startTripSession()
         }
     }
 
@@ -91,8 +106,6 @@ class ReplayHistoryActivity : AppCompatActivity() {
             val (mapboxMap, style) = deferredMapboxWithStyle.await()
             if (!isActive) return@launch
 
-            initLocationComponent(locationEngine, style, mapboxMap)
-
             val navigationMapboxMap = NavigationMapboxMap(mapView, mapboxMap, this@ReplayHistoryActivity, true)
             val navigationContext = ReplayNavigationContext(
                 locationEngine,
@@ -103,6 +116,23 @@ class ReplayHistoryActivity : AppCompatActivity() {
                 mapboxReplay
             )
             callback(navigationContext)
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+
+        HistoryFilesActivity.selectedHistory?.let {
+            val replayHistoryMapper = ReplayHistoryMapper(Gson(), ReplayCustomEventMapper(), MapboxLogger)
+            val replayEvents = replayHistoryMapper.mapToReplayEvents(it)
+            navigationContext?.mapboxReplayer?.stop()
+            navigationContext?.mapboxReplayer?.clearEvents()
+            navigationContext?.mapboxReplayer?.pushEvents(replayEvents)
+            navigationContext?.mapboxReplayer?.seekTo(0.0)
+
+            // We have a new set of data, so reset the navigator
+            MapboxNativeNavigatorImpl.create(HandheldProfile(), MapboxLogger)
+            navigationContext?.mapboxReplayer?.playFirstLocation()
         }
     }
 
@@ -205,19 +235,18 @@ class ReplayHistoryActivity : AppCompatActivity() {
         mapboxNavigation.startTripSession()
     }
 
-    @SuppressLint("RestrictedApi")
-    private fun initLocationComponent(locationEngine: LocationEngine, loadedMapStyle: Style, mapboxMap: MapboxMap) {
-        mapboxMap.moveCamera(CameraUpdateFactory.zoomTo(15.0))
-        mapboxMap.locationComponent.let { locationComponent ->
-            val locationComponentActivationOptions =
-                LocationComponentActivationOptions.builder(this, loadedMapStyle)
-                    .locationEngine(locationEngine)
-                    .build()
+    private class FirstLocationCallback(navigationContext: ReplayNavigationContext) :
+        LocationEngineCallback<LocationEngineResult> {
 
-            locationComponent.activateLocationComponent(locationComponentActivationOptions)
-            locationComponent.isLocationComponentEnabled = true
-            locationComponent.cameraMode = CameraMode.TRACKING
-            locationComponent.renderMode = RenderMode.COMPASS
+        private val navigationContextRef = WeakReference(navigationContext)
+
+        override fun onSuccess(result: LocationEngineResult?) {
+            result?.locations?.firstOrNull()?.let {
+                navigationContextRef.get()?.mapboxMap?.locationComponent?.forceLocationUpdate(it)
+            }
+        }
+
+        override fun onFailure(exception: Exception) {
         }
     }
 
